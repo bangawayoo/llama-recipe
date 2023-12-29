@@ -15,7 +15,7 @@ def test_custom_dataset(step_lr, optimizer, get_model, train, mocker):
     kwargs = {
         "dataset": "custom_dataset",
         "model_name": "decapoda-research/llama-7b-hf", # We use the tokenizer as a surrogate for llama2 tokenizer here
-        "custom_dataset.file": "examples/custom_dataset.py",
+        "custom_dataset.file": "examples/chat_dataset.py",
         "custom_dataset.train_split": "validation",
         "batch_size_training": 2,
         "use_peft": False,
@@ -62,7 +62,7 @@ def test_unknown_dataset_error(step_lr, optimizer, tokenizer, get_model, train, 
 
     kwargs = {
         "dataset": "custom_dataset",
-        "custom_dataset.file": "examples/custom_dataset.py:get_unknown_dataset",
+        "custom_dataset.file": "examples/chat_dataset.py:get_unknown_dataset",
         "batch_size_training": 1,
         "use_peft": False,
         }

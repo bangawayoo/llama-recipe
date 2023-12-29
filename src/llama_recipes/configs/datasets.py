@@ -31,6 +31,27 @@ class alpaca_dataset:
 @dataclass
 class custom_dataset:
     dataset: str = "custom_dataset"
-    file: str = "examples/custom_dataset.py"
+    file: str = "examples/chat_dataset.py"
+    train_split: str = "train"
+    test_split: str = "validation"
+
+@dataclass
+class chat_dataset:
+    dataset: str = "chat_dataset"
+    file: str = "examples/chat_dataset.py"
+    train_split: str = "train"
+    test_split: str = "validation"
+
+@dataclass
+class instruction_dataset:
+    dataset: str = "instruction_dataset"
+    file: str = "examples/chat_dataset.py"
+    train_split: str = "train"
+    test_split: str = "validation"
+
+@dataclass
+class info_dataset:
+    dataset: str = "info_dataset"
+    file: str = "examples/chat_dataset.py"
     train_split: str = "train"
     test_split: str = "validation"

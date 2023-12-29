@@ -3,6 +3,7 @@
 
 import os
 from pkg_resources import packaging
+from pathlib import Path
 
 import fire
 import torch
@@ -20,10 +21,19 @@ from transformers import (
     LlamaTokenizer,
     LlamaConfig,
     default_data_collator,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoConfig,
+    DataCollatorForTokenClassification,
+    DataCollatorForSeq2Seq,
+    get_linear_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+    get_scheduler
 )
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+import wandb
 
-from llama_recipes.configs import fsdp_config, train_config
+from llama_recipes.configs import fsdp_config, train_config, convert_to_dict
 from llama_recipes.policies import AnyPrecisionAdamW, apply_fsdp_checkpointing
 
 from llama_recipes.utils import fsdp_auto_wrap_policy
@@ -65,6 +75,45 @@ def main(**kwargs):
         clear_gpu_cache(local_rank)
         setup_environ_flags(rank)
 
+
+    if not train_config.enable_fsdp or local_rank == 0:
+        train_config_dict = convert_to_dict(train_config)
+        exp_tags = kwargs.get("exp_tag", "").split(",")
+        if len(exp_tags) == 0 or len(exp_tags[0]) == 0:
+            exp_tags = None
+
+        wandb.init(
+            project="chatbot",
+            entity="banga",
+            config=train_config_dict,
+            name=kwargs.get("exp_name", None),
+            tags=exp_tags,
+
+        )
+
+    ### for debugging on dataset generation ###
+    # if train_config.model_from_lora:
+    #     tokenizer_name = Path(train_config.model_name).parent.absolute()
+    # else:
+    #     tokenizer_name = train_config.model_name
+    # #Load the tokenizer and add special tokens
+    # tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    # tokenizer.padding_side = "left"
+    # tokenizer.add_special_tokens(
+    #         {
+    #             "pad_token": "<PAD>",
+    #         }
+    #     )
+    #
+    # dataset_config = generate_dataset_config(train_config, kwargs)
+    #  # Load and preprocess the dataset for training and validation
+    # dataset_train = get_preprocessed_dataset(
+    #     tokenizer,
+    #     dataset_config,
+    #     split="train",
+    # )
+    #########################################
+
     # Load the pre-trained model and setup its configuration
     use_cache = False if train_config.enable_fsdp else None
     if train_config.enable_fsdp and train_config.low_cpu_fsdp:
@@ -80,24 +129,25 @@ def main(**kwargs):
             raise Exception("latest pytorch nightly build is required to run with low_cpu_fsdp config, "
                             "please install latest nightly.")
         if rank == 0:
-            model = LlamaForCausalLM.from_pretrained(
+            model = AutoModelForCausalLM.from_pretrained(
                 train_config.model_name,
                 load_in_8bit=True if train_config.quantization else None,
                 device_map="auto" if train_config.quantization else None,
                 use_cache=use_cache,
             )
+
         else:
-            llama_config = LlamaConfig.from_pretrained(train_config.model_name)
+            llama_config = AutoConfig.from_pretrained(train_config.model_name)
             llama_config.use_cache = use_cache
             with torch.device("meta"):
-                model = LlamaForCausalLM(llama_config)
+                model = AutoModelForCausalLM.from_config(llama_config)
 
     else:
-        model = LlamaForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             train_config.model_name,
             load_in_8bit=True if train_config.quantization else None,
             device_map="auto" if train_config.quantization else None,
-            use_cache=use_cache,
+            use_cache=False,
         )
     if train_config.enable_fsdp and train_config.use_fast_kernels:
         """
@@ -121,13 +171,33 @@ def main(**kwargs):
         model.to(torch.bfloat16)
 
     # Load the tokenizer and add special tokens
-    tokenizer = LlamaTokenizer.from_pretrained(train_config.model_name)
+    if train_config.model_from_lora:
+        tokenizer_name = Path(train_config.model_name).parent.absolute()
+    else:
+        tokenizer_name = train_config.model_name
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    tokenizer.padding_side = "left"
+    tokenizer.add_eos_token = True
     tokenizer.add_special_tokens(
             {
-
                 "pad_token": "<PAD>",
             }
         )
+    model.resize_token_embeddings(len(tokenizer))
+
+    dataset_config = generate_dataset_config(train_config, kwargs)
+
+     # Load and preprocess the dataset for training and validation
+    dataset_train = get_preprocessed_dataset(
+        tokenizer,
+        dataset_config,
+        split="train",
+    )
+
+    if rank==0:
+        print("Saving tokenizer...")
+        tokenizer.save_pretrained(train_config.output_dir)
+
     if train_config.use_peft:
         peft_config = generate_peft_config(train_config, kwargs)
         model = get_peft_model(model, peft_config)
@@ -136,12 +206,10 @@ def main(**kwargs):
     #setting up FSDP if enable_fsdp is enabled
     if train_config.enable_fsdp:
         if not train_config.use_peft and train_config.freeze_layers:
-
             freeze_transformer_layers(train_config.num_freeze_layers)
 
         mixed_precision_policy, wrapping_policy = get_policies(fsdp_config, rank)
         my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, LlamaDecoderLayer)
-
         model = FSDP(
             model,
             auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
@@ -159,14 +227,6 @@ def main(**kwargs):
     elif not train_config.quantization and not train_config.enable_fsdp:
         model.to("cuda")
 
-    dataset_config = generate_dataset_config(train_config, kwargs)
-
-     # Load and preprocess the dataset for training and validation
-    dataset_train = get_preprocessed_dataset(
-        tokenizer,
-        dataset_config,
-        split="train",
-    )
 
     if not train_config.enable_fsdp or rank == 0:
         print(f"--> Training Set Length = {len(dataset_train)}")
@@ -194,6 +254,13 @@ def main(**kwargs):
                 rank=dist.get_rank(),
                 num_replicas=dist.get_world_size(),
             )
+
+    data_collator = DataCollatorForSeq2Seq(tokenizer,
+                                           pad_to_multiple_of=8,
+                                           return_tensors="pt",
+                                           padding=True)
+
+    default_data_collator = data_collator
 
     # Create DataLoaders for the training and validation dataset
     train_dataloader = torch.utils.data.DataLoader(
@@ -234,7 +301,10 @@ def main(**kwargs):
             lr=train_config.lr,
             weight_decay=train_config.weight_decay,
         )
-    scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
+    total_steps = train_config.num_epochs * len(train_dataloader)
+    warmup_steps = train_config.warmup_steps
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    # scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     # Start the training process
     results = train(
@@ -252,6 +322,12 @@ def main(**kwargs):
     )
     if not train_config.enable_fsdp or rank==0:
         [print(f'Key: {k}, Value: {v}') for k, v in results.items()]
+
+    if kwargs.get("hub_name"):
+        hub_name = kwargs['hub_name']
+        tokenizer.push_to_hub(hub_name)
+        model.push_to_hub(hub_name)
+        print(f"Model pushed to {hub_name}")
 
 if __name__ == "__main__":
     fire.Fire(main)

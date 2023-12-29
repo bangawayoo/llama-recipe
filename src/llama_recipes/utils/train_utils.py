@@ -15,9 +15,15 @@ from torch.distributed.fsdp import StateDictType
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from tqdm import tqdm
 from transformers import LlamaTokenizer
+import wandb
 
 
-from llama_recipes.model_checkpointing import save_model_checkpoint, save_model_and_optimizer_sharded, save_optimizer_checkpoint
+from llama_recipes.model_checkpointing import (
+    save_model_checkpoint,
+    save_model_and_optimizer_sharded,
+    save_optimizer_checkpoint,
+    save_hf_checkpoint
+)
 from llama_recipes.policies import fpSixteen,bfSixteen_mixed, get_llama_wrapper
 from llama_recipes.utils.memory_utils import MemoryTrace
 
@@ -95,7 +101,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         optimizer.zero_grad()
                         pbar.update(1)
 
-                pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
+                pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} \
+                                        completed (loss: {loss.detach().float()})")
             pbar.close()
                 
         epoch_end_time = time.perf_counter()-epoch_start_time
@@ -110,7 +117,14 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         
         train_prep.append(train_perplexity)
         train_loss.append(train_epoch_loss)
-        
+        if rank == 0:
+            wandb.log(
+                {
+                    'train/ppl': train_perplexity,
+                    'train/loss': train_epoch_loss
+                }
+            )
+
         if train_config.enable_fsdp:
             if rank==0:
                 print(f"Max CUDA memory allocated was {memtrace.peak} GB")
@@ -127,7 +141,13 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         
         # Update the learning rate as needed
         lr_scheduler.step()
-          
+        if train_config.use_peft:
+            ckpt_dir = os.path.join(train_config.output_dir, f"Ep{epoch}")
+            model.save_pretrained(ckpt_dir)
+        else:
+            save_hf_checkpoint(model, rank, train_config)
+
+
         if train_config.run_validation:
             eval_ppl, eval_epoch_loss = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer)
             checkpoint_start_time = time.perf_counter()
@@ -187,6 +207,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                 print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_end_time}s")
         else:
             print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_end_time}s")
+
+
+    save_model_and_optimizer_sharded(model, rank, train_config)
     avg_epoch_time = sum(epoch_times)/ len(epoch_times)
     avg_checkpoint_time = sum(checkpoint_times)/ len(checkpoint_times) if len(checkpoint_times) > 0 else 0
     avg_train_prep = sum(train_prep)/len(train_prep)
@@ -381,14 +404,12 @@ def save_train_params(train_config, fsdp_config, rank):
     train_config.dist_checkpoint_root_folder
     + "/"
     + train_config.dist_checkpoint_folder
-    + "-"
-    + train_config.model_name
     )
 
     save_dir = Path.cwd() / folder_name
     # If the directory does not exist, create it
     if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+        os.makedirs(save_dir, exist_ok=True)
     # Convert the dictionary to a YAML string
     config_yaml = yaml.dump(train_params_dict, indent=4)
     file_name = os.path.join(save_dir,'train_params.yaml')

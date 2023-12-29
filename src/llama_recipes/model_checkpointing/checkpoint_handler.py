@@ -1,6 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
-
+import os
 from pathlib import Path
 from datetime import datetime
 import torch
@@ -90,11 +90,10 @@ def save_model_and_optimizer_sharded(model, rank, cfg,optim=None):
         cfg.dist_checkpoint_root_folder
         + "/"
         + cfg.dist_checkpoint_folder
-        + "-"
-        + cfg.model_name
     )
 
     save_dir = Path.cwd() / folder_name
+    os.makedirs(save_dir, exist_ok=True)
     if rank == 0:
         print(f"Saving model to {save_dir}")
 
@@ -135,7 +134,6 @@ def save_model_checkpoint(
         model, StateDictType.FULL_STATE_DICT, fullstate_save_policy
     ):
         cpu_state = model.state_dict()
-
         print(f"saving process: rank {rank}  done w model state_dict\n")
    
 
@@ -146,12 +144,10 @@ def save_model_checkpoint(
         cfg.dist_checkpoint_root_folder
         + "/"
         + cfg.dist_checkpoint_folder
-        + "-"
-        + cfg.model_name
         )
         save_dir = Path.cwd() / folder_name
-        save_dir.mkdir(parents=True, exist_ok=True)
-        save_name = cfg.model_name + "-" + str(epoch) + ".pt"
+        os.makedirs(save_dir, exist_ok=True)
+        save_name = str(epoch) + ".pt"
         save_full_path = str(save_dir) + "/" + save_name
 
         # save model
@@ -159,8 +155,23 @@ def save_model_checkpoint(
 
         
         print(f"model checkpoint saved for epoch {epoch} at {save_full_path}\n")
-      
 
+
+def save_hf_checkpoint(
+        model,
+        rank,
+        cfg,
+):
+    """saving model via rank0 cpu streaming and full_state_dict"""
+
+    with FSDP.state_dict_type(
+            model, StateDictType.FULL_STATE_DICT, fullstate_save_policy
+    ):
+        cpu_state = model.state_dict()
+        if rank == 0:
+            model.save_pretrained(cfg.output_dir, state_dict=cpu_state)
+
+        print(f"saving process: rank {rank}  done w model state_dict\n")
 
 def load_model_checkpoint(model, rank, cfg):
     """load local checkpoint to rank0 cpu
